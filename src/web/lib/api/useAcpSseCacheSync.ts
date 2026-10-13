@@ -31,12 +31,41 @@ import {
 } from '../../pwa/notifications.ts';
 import { playTaskCompletionSound } from '../../pwa/task-completion-sound.ts';
 import { dispatchAcpSseBrowserEvent } from './acp-sse-browser-event.ts';
-import { applySessionMessageEventToMessages, newPermissionRequests } from './acp-sse-cache.pure.ts';
+import {
+  applySessionMessageEventToMessages,
+  newPermissionRequests,
+  runningSessionIdsForCatchUp,
+  shouldCatchUpSessionMessagesOnStatusChange,
+} from './acp-sse-cache.pure.ts';
 import { fetchAcpPermissionRequests, fetchProjects, fetchSessions } from './acp.ts';
 import { acpSseUrl } from './client.ts';
 
 /** ACP の非メッセージ系 SSE が連打されるため、fetch の間隔を空ける */
 const ACP_SSE_FETCH_DEBOUNCE_MS = 300;
+
+type PendingSseWork = {
+  needSessionsList: boolean;
+  pausedSessionIds: Set<string>;
+  removedSessionIds: Set<string>;
+  catalogUpdates: Set<string>;
+  permissionRequestsUpdated: boolean;
+  /** Sessions whose transcript should be refetched (missed SSE deltas). */
+  catchupSessionIds: Set<string>;
+};
+
+const createPendingSseWork = (): PendingSseWork => ({
+  needSessionsList: false,
+  pausedSessionIds: new Set(),
+  removedSessionIds: new Set(),
+  catalogUpdates: new Set(),
+  permissionRequestsUpdated: false,
+  catchupSessionIds: new Set(),
+});
+
+const invalidateSessionMessageQueries = (queryClient: QueryClient, sessionId: string): void => {
+  void queryClient.invalidateQueries({ queryKey: sessionMessagesQueryKey(sessionId) });
+  void queryClient.invalidateQueries({ queryKey: sessionMessagesInfiniteQueryKey(sessionId) });
+};
 
 const applyMessageEvent = (queryClient: QueryClient, event: AcpSseEvent): boolean => {
   if (event.type !== 'message-add' && event.type !== 'message-delta') {
@@ -83,13 +112,7 @@ const applyMessageEvent = (queryClient: QueryClient, event: AcpSseEvent): boolea
 };
 
 const mergeEventToPending = (
-  pending: {
-    needSessionsList: boolean;
-    pausedSessionIds: Set<string>;
-    removedSessionIds: Set<string>;
-    catalogUpdates: Set<string>;
-    permissionRequestsUpdated: boolean;
-  },
+  pending: PendingSseWork,
   event: AcpSseEvent,
   knownStatuses: Map<string, SessionStatus>,
   statusFromCache: (sessionId: string) => SessionStatus | null,
@@ -105,6 +128,7 @@ const mergeEventToPending = (
   if (event.type === 'session_removed') {
     pending.removedSessionIds.add(event.sessionId);
     pending.needSessionsList = true;
+    pending.catchupSessionIds.delete(event.sessionId);
     knownStatuses.delete(event.sessionId);
     return;
   }
@@ -114,6 +138,14 @@ const mergeEventToPending = (
       const previousStatus = knownStatuses.get(event.sessionId) ?? statusFromCache(event.sessionId);
       if (previousStatus === 'running' && event.status === 'paused') {
         pending.pausedSessionIds.add(event.sessionId);
+      }
+      if (
+        shouldCatchUpSessionMessagesOnStatusChange({
+          previousStatus,
+          nextStatus: event.status,
+        })
+      ) {
+        pending.catchupSessionIds.add(event.sessionId);
       }
       knownStatuses.set(event.sessionId, event.status);
     }
@@ -251,13 +283,7 @@ const notifyPermissionRequests = async (
 
 const flushPending = async (
   queryClient: QueryClient,
-  pending: {
-    needSessionsList: boolean;
-    pausedSessionIds: Set<string>;
-    removedSessionIds: Set<string>;
-    catalogUpdates: Set<string>;
-    permissionRequestsUpdated: boolean;
-  },
+  pending: PendingSseWork,
   knownStatuses: Map<string, SessionStatus>,
   knownPermissionRequestIds: Set<string>,
 ): Promise<void> => {
@@ -267,12 +293,14 @@ const flushPending = async (
     removedSessionIds: new Set(pending.removedSessionIds),
     catalogUpdates: new Set(pending.catalogUpdates),
     permissionRequestsUpdated: pending.permissionRequestsUpdated,
+    catchupSessionIds: new Set(pending.catchupSessionIds),
   };
   pending.needSessionsList = false;
   pending.pausedSessionIds.clear();
   pending.removedSessionIds.clear();
   pending.catalogUpdates.clear();
   pending.permissionRequestsUpdated = false;
+  pending.catchupSessionIds.clear();
 
   const cachedSessions = queryClient.getQueryData<SessionsResponse>(sessionsQueryKey);
   for (const sessionId of work.removedSessionIds) {
@@ -294,6 +322,14 @@ const flushPending = async (
         null;
       if (previousStatus === 'running' && session.status === 'paused') {
         work.pausedSessionIds.add(session.sessionId);
+      }
+      if (
+        shouldCatchUpSessionMessagesOnStatusChange({
+          previousStatus,
+          nextStatus: session.status,
+        })
+      ) {
+        work.catchupSessionIds.add(session.sessionId);
       }
       knownStatuses.set(session.sessionId, session.status);
     }
@@ -334,6 +370,12 @@ const flushPending = async (
   if (freshSessions !== null && work.pausedSessionIds.size > 0) {
     await notifyPausedSessions(queryClient, freshSessions, work.pausedSessionIds);
   }
+  for (const sessionId of work.catchupSessionIds) {
+    if (work.removedSessionIds.has(sessionId)) {
+      continue;
+    }
+    invalidateSessionMessageQueries(queryClient, sessionId);
+  }
 };
 
 export const useAcpSseCacheSync = (): void => {
@@ -344,13 +386,7 @@ export const useAcpSseCacheSync = (): void => {
 
   useEffect(() => {
     const knownStatuses = knownStatusesRef.current;
-    const pending = {
-      needSessionsList: false,
-      pausedSessionIds: new Set<string>(),
-      removedSessionIds: new Set<string>(),
-      catalogUpdates: new Set<string>(),
-      permissionRequestsUpdated: false,
-    };
+    const pending = createPendingSseWork();
 
     const statusFromCache = (sessionId: string): SessionStatus | null => {
       const sessionsResponse = queryClient.getQueryData<SessionsResponse>(sessionsQueryKey);
@@ -375,6 +411,21 @@ export const useAcpSseCacheSync = (): void => {
       }, ACP_SSE_FETCH_DEBOUNCE_MS);
     };
 
+    const scheduleCatchUpForRunningSessions = () => {
+      for (const sessionId of runningSessionIdsForCatchUp(knownStatuses)) {
+        pending.catchupSessionIds.add(sessionId);
+      }
+      const cachedSessions = queryClient.getQueryData<SessionsResponse>(sessionsQueryKey);
+      for (const session of cachedSessions?.sessions ?? []) {
+        if (session.status === 'running') {
+          pending.catchupSessionIds.add(session.sessionId);
+        }
+      }
+      if (pending.catchupSessionIds.size > 0) {
+        scheduleFlush();
+      }
+    };
+
     const source = new EventSource(acpSseUrl(), { withCredentials: false });
     const onMessage = (ev: MessageEvent<string>) => {
       if (typeof ev.data !== 'string') {
@@ -394,9 +445,14 @@ export const useAcpSseCacheSync = (): void => {
       scheduleFlush();
     };
     source.onmessage = onMessage;
+    // Browser reconnects EventSource automatically; missed deltas are not replayed.
+    source.onerror = () => {
+      scheduleCatchUpForRunningSessions();
+    };
     const knownPermissionRequestIds = knownPermissionRequestIdsRef.current;
     return () => {
       source.onmessage = null;
+      source.onerror = null;
       source.close();
       if (timerRef.current !== undefined) {
         clearTimeout(timerRef.current);
@@ -407,7 +463,8 @@ export const useAcpSseCacheSync = (): void => {
         pending.pausedSessionIds.size > 0 ||
         pending.removedSessionIds.size > 0 ||
         pending.catalogUpdates.size > 0 ||
-        pending.permissionRequestsUpdated;
+        pending.permissionRequestsUpdated ||
+        pending.catchupSessionIds.size > 0;
       if (hasWork) {
         void flushPending(queryClient, pending, knownStatuses, knownPermissionRequestIds);
       }
